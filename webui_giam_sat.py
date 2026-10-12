@@ -7,16 +7,80 @@ import sys
 import json
 import logging
 import threading
-import webbrowser
+import tempfile
+from urllib.parse import urlsplit as _urlsplit
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, send_file, send_from_directory
 
 from config import DUONG_DAN
 import kiem_tra_bai_no
+import cao_fb
+
+PROXIES_FILE = os.path.join(DUONG_DAN, "proxies.txt")
+MAX_PROXIES = 50
+
+
+def _proxy_lines(raw):
+    if not isinstance(raw, str) or len(raw) > 16000:
+        raise ValueError("Danh sách proxy phải là văn bản tối đa 16.000 ký tự.")
+    lines = [line.strip() for line in raw.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if len(lines) > MAX_PROXIES:
+        raise ValueError(f"Tối đa {MAX_PROXIES} proxy mỗi lần lưu hoặc kiểm tra.")
+    for i, line in enumerate(lines, 1):
+        if cao_fb.phai_dong_local(line):
+            raise ValueError(f"Dòng {i}: để trống danh sách để dùng IP máy, không nhập 'local'.")
+        url = cao_fb.chuan_hoa_proxy(line)
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+            if (parsed.scheme not in ("http", "https", "socks5") or not parsed.hostname
+                    or not port or parsed.path not in ("", "/") or parsed.query or parsed.fragment
+                    or (parsed.username is None) != (parsed.password is None)):
+                raise ValueError("invalid")
+        except ValueError:
+            raise ValueError(f"Dòng {i}: định dạng proxy không hợp lệ; dùng host:port hoặc host:port:user:pass.") from None
+    return lines
+
+
+def _read_proxy_lines():
+    if not os.path.exists(PROXIES_FILE):
+        return []
+    with open(PROXIES_FILE, "r", encoding="utf-8-sig") as f:
+        return [line.strip() for line in f if line.strip() and not line.lstrip().startswith("#")]
+
+
+def _proxy_label(raw):
+    parsed = urlsplit(cao_fb.chuan_hoa_proxy(raw))
+    return f"{parsed.hostname}:{parsed.port}"
 
 app = Flask(__name__, template_folder=os.path.join(DUONG_DAN, "templates"),
             static_folder=os.path.join(DUONG_DAN, "static"))
 app.config["JSON_AS_ASCII"] = False
+# Allow embedding in the authenticated Orbit dashboard from this local origin.
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+# This control panel has no user authentication and contains sensitive operations.
+# Only accept loopback clients so the app is not exposed to the LAN/Internet.
+@app.before_request
+def chi_cho_phep_truy_cap_local():
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"ok": False, "thong_bao": "Chỉ cho phép truy cập từ máy chạy công cụ."}), 403
+
+@app.after_request
+def cho_phep_nhung_trong_orbit(response):
+    # Flask 3 defaults to X-Frame-Options: SAMEORIGIN; Orbit runs on port 8080.
+    response.headers.pop("X-Frame-Options", None)
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'self' http://localhost:8080 http://127.0.0.1:8080"
+    origin = request.headers.get("Origin", "")
+    allowed = {"http://localhost:8080", "http://127.0.0.1:8080"}
+    if origin in allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Requested-With"
+        response.headers["Vary"] = "Origin"
+    return response
 
 # Tắt log spam của Werkzeug
 log = logging.getLogger("werkzeug")
@@ -61,13 +125,82 @@ def api_bai_no_cau_hinh():
             cfg["masters_kich_hoat"] = data["masters_kich_hoat"]
         if "danh_sach_profile" in data:
             cfg["danh_sach_profile"] = data["danh_sach_profile"]
+        if "link_xac_minh_cmt" in data:
+            link = str(data["link_xac_minh_cmt"] or "").strip()
+            if link and not kiem_tra_bai_no._ten_mien_link(link):
+                return jsonify({"ok": False, "thong_bao": "Link xác minh phải là URL http(s):// có tên miền hợp lệ."}), 400
+            cfg["link_xac_minh_cmt"] = link
         kiem_tra_bai_no.luu_cau_hinh(cfg)
+        if "danh_sach_profile" in data and kiem_tra_bai_no.GIAM_SAT_THREAD and kiem_tra_bai_no.GIAM_SAT_THREAD.is_alive():
+            kiem_tra_bai_no.DOI_DANH_SACH_EVENT.set()
         return jsonify({"ok": True, "thong_bao": "Đã lưu cấu hình giám sát bài nổ!", "cau_hinh": cfg})
 
     cfg = kiem_tra_bai_no.doc_cau_hinh()
     kq_3m = kiem_tra_bai_no.nap_danh_sach_profile_tu_3_master(cfg.get("masters_kich_hoat"))
     cfg["so_luong_theo_master"] = kq_3m.get("so_luong_theo_master", {})
     return jsonify(cfg)
+
+
+@app.route("/api/bai_no/proxies", methods=["GET", "POST"])
+def api_bai_no_proxies():
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"ok": False, "thong_bao": "Cấu hình proxy chỉ truy cập được từ máy cục bộ."}), 403
+    if request.method == "GET":
+        resp = jsonify({"ok": True, "proxies": "\n".join(_read_proxy_lines())})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    data = request.get_json(silent=True) or {}
+    try:
+        lines = _proxy_lines(data.get("proxies"))
+    except ValueError as e:
+        return jsonify({"ok": False, "thong_bao": str(e)}), 400
+    # Thay file nguyên tử: worker đang quét sẽ dùng cấu hình cũ tới vòng kế tiếp.
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=DUONG_DAN,
+                                         prefix=".proxies-", suffix=".tmp", delete=False) as f:
+            temp_path = f.name
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        os.replace(temp_path, PROXIES_FILE)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+    kiem_tra_bai_no.cap_nhat_trang_thai(log_moi=f"🔒 Đã lưu {len(lines)} proxy (không ghi tài khoản vào log); áp dụng ở vòng quét tiếp theo.")
+    return jsonify({"ok": True, "so_luong": len(lines),
+                    "thong_bao": f"Đã lưu {len(lines)} proxy. Áp dụng từ vòng quét tiếp theo; để trống dùng IP máy."})
+
+
+@app.route("/api/bai_no/proxies/kiem_tra", methods=["POST"])
+def api_bai_no_kiem_tra_proxies():
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify({"ok": False, "thong_bao": "Chỉ kiểm tra proxy từ máy cục bộ."}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        lines = _proxy_lines(data.get("proxies"))
+    except ValueError as e:
+        return jsonify({"ok": False, "thong_bao": str(e)}), 400
+    if not lines:
+        return jsonify({"ok": False, "thong_bao": "Chưa nhập proxy; để trống sẽ dùng IP máy."}), 400
+
+    def check_one(item):
+        index, line = item
+        try:
+            import requests
+            px = cao_fb.chuan_hoa_proxy(line)
+            r = requests.get("https://www.facebook.com/", proxies={"http": px, "https": px},
+                             timeout=6, allow_redirects=True,
+                             headers={"User-Agent": "Mozilla/5.0"})
+            ok = r.status_code in (200, 301, 302, 403)
+            return {"dong": index, "proxy": _proxy_label(line), "ok": ok,
+                    "thong_bao": f"Facebook trả HTTP {r.status_code}"}
+        except Exception:
+            return {"dong": index, "proxy": _proxy_label(line), "ok": False,
+                    "thong_bao": "Không kết nối được tới Facebook trong 6 giây (kiểm tra IP, cổng hoặc tài khoản)."}
+
+    with ThreadPoolExecutor(max_workers=min(5, len(lines))) as pool:
+        results = list(pool.map(check_one, enumerate(lines, 1)))
+    return jsonify({"ok": True, "ket_qua": results, "so_song": sum(x["ok"] for x in results),
+                    "thong_bao": "Thử kết nối HTTPS tới Facebook; không bảo đảm Playwright đọc được bài."})
 
 
 @app.route("/api/bai_no/bat_dau", methods=["POST"])
@@ -138,8 +271,48 @@ def api_bai_no_nap_tu_master():
 
 @app.route("/api/bai_no/lich_su", methods=["GET"])
 def api_bai_no_lich_su():
-    resp = jsonify(kiem_tra_bai_no.doc_lich_su())
-    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    """Chỉ gửi một trang cảnh báo; không trả toàn bộ lịch sử mỗi lần làm mới."""
+    try:
+        page = int(request.args.get("page", "1"))
+        per_page = int(request.args.get("per_page", "20"))
+    except ValueError:
+        return jsonify({"ok": False, "thong_bao": "Trang hoặc số bài/trang không hợp lệ"}), 400
+    if page < 1 or page > 100000 or per_page not in (10, 20, 50):
+        return jsonify({"ok": False, "thong_bao": "Chỉ hỗ trợ 10, 20 hoặc 50 bài/trang"}), 400
+    loai = request.args.get("filter", "tat_ca")
+    if loai not in ("tat_ca", "can_cmt", "da_ok"):
+        return jsonify({"ok": False, "thong_bao": "Bộ lọc không hợp lệ"}), 400
+    # Optional profile/page filter, matched against stored profile name, page name or link.
+    profile_filter = request.args.get("profile", "").strip()
+    if len(profile_filter) > 300:
+        return jsonify({"ok": False, "thong_bao": "Bộ lọc Page không hợp lệ"}), 400
+    all_items = kiem_tra_bai_no.doc_lich_su().get("danh_sach", [])
+    profile_options = {}
+    for item in all_items:
+        label = str(item.get("ten_page") or item.get("profile") or "").strip()
+        if label:
+            key = str(item.get("link_profile") or label).strip()
+            profile_options.setdefault(key, label)
+    items = all_items
+    if profile_filter:
+        items = [it for it in items if (str(it.get("link_profile") or "").strip() == profile_filter
+                 if profile_filter.startswith("http") else
+                 str(it.get("ten_page") or it.get("profile") or "").strip() == profile_filter)]
+    can_cmt = lambda it: not it.get("da_gan_cmt") and (it.get("comments") == 0 or it.get("loai") == "BAI_NO_CHUA_LINK")
+    counts = {"tat_ca": len(items), "can_cmt": sum(1 for it in items if can_cmt(it)),
+              "da_ok": sum(1 for it in items if it.get("da_gan_cmt"))}
+    if loai == "can_cmt":
+        items = [it for it in items if can_cmt(it)]
+    elif loai == "da_ok":
+        items = [it for it in items if it.get("da_gan_cmt")]
+    total = len(items)
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, total_pages)
+    start = (page - 1) * per_page
+    resp = jsonify({"ok": True, "danh_sach": items[start:start + per_page], "total": total,
+                    "counts": counts, "profiles": [{"key": key, "label": label} for key, label in sorted(profile_options.items(), key=lambda pair: pair[1].casefold())],
+                    "page": page, "per_page": per_page, "total_pages": total_pages})
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
@@ -162,12 +335,6 @@ def media_proxy():
     return send_file(path)
 
 
-def mo_trinh_duyet():
-    import time
-    time.sleep(1.2)
-    webbrowser.open("http://127.0.0.1:5005")
-
-
 if __name__ == "__main__":
     print("=" * 65)
     print("🚀 HỆ THỐNG GIÁM SÁT BÀI NỔ 24/24 (BẢN CHẠY RIÊNG ĐỘC LẬP)")
@@ -175,5 +342,4 @@ if __name__ == "__main__":
     print("🛡️ Quét view Reels & Timeline, tự phát hiện bài nổ và báo Telegram")
     print("=" * 65)
 
-    threading.Thread(target=mo_trinh_duyet, daemon=True).start()
-    app.run(host="0.0.0.0", port=5005, debug=False, threaded=True)
+    app.run(host="127.0.0.1", port=5005, debug=False, threaded=True)

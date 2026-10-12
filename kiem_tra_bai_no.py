@@ -13,6 +13,7 @@ import hashlib
 import threading
 import subprocess
 import concurrent.futures
+from urllib.parse import urlsplit, unquote
 from datetime import datetime
 import openpyxl
 
@@ -41,7 +42,14 @@ FILE_LICH_SU = os.path.join(THU_MUC_TRAFFIC, "lich_su_bai_no.json")
 
 KHOA = threading.RLock()
 STOP_EVENT = threading.Event()
+DOI_DANH_SACH_EVENT = threading.Event()
+KHOA_VONG_QUET = threading.Lock()
 GIAM_SAT_THREAD = None
+QUET_THU_CONG_THREAD = None
+KHOA_XAC_MINH = threading.Lock()
+XAC_MINH_THREAD = None
+VI_TRI_XAC_MINH_CU = 0
+LINK_XAC_MINH_MAC_DINH = "https://zycieirodzina.danhngon.pro/blog/czesc-2-wszystko-co-dalam-im-za-darmo"
 
 
 def _tao_fingerprints_bai(ten_prof: str, post_id: str, post_url: str, caption: str) -> list[str]:
@@ -180,12 +188,14 @@ def doc_cau_hinh() -> dict:
                     cfg["masters_kich_hoat"] = {"us": True, "us2": True, "global": True}
                 if "nguong_view" not in cfg:
                     cfg["nguong_view"] = 1000
+                cfg.setdefault("link_xac_minh_cmt", LINK_XAC_MINH_MAC_DINH)
                 return cfg
         except Exception:
             pass
     mac_dinh = {
         "telegram_target": "-5314274362",
         "nguong_view": 1000,
+        "link_xac_minh_cmt": LINK_XAC_MINH_MAC_DINH,
         "nguong_like": 10,
         "so_bai_quet": 6,
         "chu_ky_phut": 5,
@@ -218,7 +228,8 @@ def doc_trang_thai() -> dict:
             st = {}
             
     # Đồng bộ trạng thái thực tế của luồng ngầm
-    is_alive = bool(GIAM_SAT_THREAD and GIAM_SAT_THREAD.is_alive())
+    is_alive = bool((GIAM_SAT_THREAD and GIAM_SAT_THREAD.is_alive()) or
+                    (QUET_THU_CONG_THREAD and QUET_THU_CONG_THREAD.is_alive()))
     if not is_alive:
         st["dang_chay"] = False
         
@@ -305,6 +316,10 @@ def doc_lich_su() -> dict:
             or any(fp in set_da_ok for fp in item_fps)
         )
         item["da_gan_cmt"] = la_da_ok
+        if la_da_ok and item.get("xac_minh_cmt") != "da_co_link":
+            item["xac_minh_cmt"] = "thu_cong"
+        elif not la_da_ok and item.get("xac_minh_cmt") in ("thu_cong", "da_co_link"):
+            item["xac_minh_cmt"] = "chua_xac_minh"
         danh_sach_loc.append(item)
 
         fps = item.get("fingerprints") or _tao_fingerprints_bai(
@@ -400,6 +415,7 @@ def danh_dau_bai_no_ok(identifier: str, da_gan_cmt: bool = True) -> tuple[bool, 
             if la_khop:
                 so_khop += 1
                 item["da_gan_cmt"] = da_gan_cmt
+                item["xac_minh_cmt"] = "thu_cong" if da_gan_cmt else "chua_xac_minh"
                 if p_id:
                     keys_to_affect.add(p_id)
                     keys_to_affect.add(f"id:{p_id}")
@@ -436,6 +452,244 @@ def danh_dau_bai_no_ok(identifier: str, da_gan_cmt: bool = True) -> tuple[bool, 
 
         msg = "Đã đánh dấu OK (đã gắn cmt) thành công! Hệ thống sẽ không thông báo lại bài này nữa." if da_gan_cmt else "Đã hủy đánh dấu OK."
         return True, msg
+
+
+def _url_bao_chuan(u: str) -> str:
+    """So khớp chính xác host + path của link bài báo, bỏ query/trailing slash."""
+    try:
+        s = urlsplit(str(u or "").strip())
+        if s.scheme not in ("http", "https") or not s.hostname:
+            return ""
+        host = s.hostname.lower().removeprefix("www.")
+        path = unquote(s.path).rstrip("/").lower()
+        return host + path if path else ""
+    except ValueError:
+        return ""
+
+
+def _ten_mien_link(u: str) -> str:
+    """Tên miền chính xác của URL http(s), không nhận chuỗi con hoặc tên miền giả."""
+    try:
+        parsed = urlsplit(str(u or "").strip())
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            return ""
+        return parsed.hostname.lower()
+    except ValueError:
+        return ""
+
+
+def _tim_link_trong_cmt(texts: list[str], expected: str) -> bool:
+    target = _ten_mien_link(expected)
+    if not target:
+        return False
+    for text in texts:
+        for raw in re.findall(r"https?://[^\s<>\"']+", text or "", flags=re.I):
+            for candidate in (raw.rstrip(".,;!?)]}"), unquote(raw).rstrip(".,;!?)]}")):
+                if _ten_mien_link(candidate) == target:
+                    return True
+    return False
+
+
+def _lay_url_binh_luan_da_hien(page) -> list[str]:
+    """Đọc URL trong bình luận của hộp thoại bài đang mở, không lấy caption/bài khác."""
+    return page.evaluate("""() => {
+      const modal = [...document.querySelectorAll('[role="dialog"]')].filter(el =>
+        /bài viết của|post by/i.test((el.innerText || '').slice(0, 150))).pop();
+      if (!modal) return [];
+      const text = modal.innerText || '';
+      const marker = /(?:phù hợp nhất|most relevant)/i.exec(text);
+      if (!marker) return [];
+      // Chỉ lấy phần sau thanh sắp xếp bình luận của hộp thoại này;
+      // không lấy caption hay bài viết khác đang nằm phía sau modal.
+      const comments = text.slice(marker.index + marker[0].length, marker.index + marker[0].length + 9000);
+      return [comments];
+    }""") or []
+
+
+def _xac_minh_qua_page_feed(page, page_url: str, reel_id: str, expected: str) -> bool:
+    """Mở Page công khai, tìm đúng Reel theo permalink rồi mở số cmt của chính bài đó."""
+    if not reel_id or not page_url or _ten_mien_link(page_url) not in ("facebook.com", "www.facebook.com"):
+        return False
+    page.goto(page_url, wait_until="domcontentloaded", timeout=18000)
+    page.wait_for_timeout(1800)
+    # Chỉ dọn popup đăng nhập TRƯỚC khi mở bình luận; sau click phải giữ modal bài.
+    cao_fb._dong_popup_va_mo_khoa_cuon(page)
+    for _ in range(20):
+        if STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set():
+            return False
+        cao_fb._dong_popup_va_mo_khoa_cuon(page)
+        article = page.locator('[role="article"]').filter(
+            has=page.locator(f'a[href*="/reel/{reel_id}"]')).first
+        if article.count():
+            # Số bình luận phải là nút trong đúng bài; không click nút của bài khác.
+            buttons = article.locator('[role="button"]')
+            for i in reversed(range(min(buttons.count(), 40))):
+                try:
+                    button = buttons.nth(i)
+                    label = (button.inner_text(timeout=1200) or "").strip()
+                    # Ưu tiên nút số cmt phía cuối bài; xác nhận permalink sau khi mở.
+                    if not label.isdigit() or not (0 < int(label) < 100000):
+                        continue
+                    button.click(timeout=2500)
+                    if _lay_reel_id_chuan(page.url) != reel_id:
+                        continue
+                    # Facebook tải bình luận bất đồng bộ: không kết luận sau đúng 1,5 giây.
+                    for _ in range(6):
+                        if STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set():
+                            return False
+                        if _tim_link_trong_cmt(_lay_url_binh_luan_da_hien(page), expected):
+                            return True
+                        page.wait_for_timeout(850)
+                except Exception:
+                    continue
+            return False
+        page.mouse.wheel(0, 1300)
+        page.wait_for_timeout(1100)
+    return False
+
+
+def _xac_minh_mot_bai(post_url: str, expected: str, proxy=None, page_url: str = "") -> str:
+    """Chỉ trả 'da_co_link' khi URL ở bình luận có đúng tên miền đã cấu hình."""
+    try:
+        host = urlsplit(post_url).hostname if post_url else None
+    except ValueError:
+        host = None
+    if not host or not (host == "facebook.com" or host.endswith(".facebook.com")) or not _ten_mien_link(expected):
+        return "chua_xac_minh"
+    try:
+        with sync_playwright() as p:
+            browser = cao_fb.mo_trinh_duyet(p, cookies=None, proxy=proxy)
+            try:
+                ctx = browser.new_context(viewport={"width": 1280, "height": 900}, user_agent=cao_fb.DEFAULT_UA, locale="vi-VN")
+                cao_fb.chan_tai_nguyen_nang(ctx, chan_anh=True)
+                page = ctx.new_page()
+                try:
+                    # Không cài bypass popup ở bước xác minh: bộ bypass của scraper
+                    # xóa mọi [role=dialog], bao gồm hộp bình luận thật của Facebook.
+                    # Dùng context riêng, không ảnh hưởng bước quét Page chính.
+                    # Ưu tiên Page feed: mở số bình luận tại đúng bài Reel (guest Reel trực tiếp ẩn nội dung).
+                    reel_id = _lay_reel_id_chuan(post_url) if "/reel/" in post_url else ""
+                    if reel_id and page_url:
+                        for attempt in range(2):
+                            if STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set():
+                                break
+                            try:
+                                if _xac_minh_qua_page_feed(page, page_url, reel_id, expected):
+                                    return "da_co_link"
+                            except Exception as e_feed:
+                                cap_nhat_trang_thai(log_moi=f"⚠️ Không mở được bình luận từ Page cho reel {reel_id}: {type(e_feed).__name__}")
+                            # Facebook đôi khi chỉ tải 3 bài đầu vào lần truy cập đầu;
+                            # thử lại feed trước khi kết luận cmt bị ẩn với khách.
+                            if attempt == 0:
+                                page.wait_for_timeout(700)
+                    else:
+                        page.goto(post_url, wait_until="domcontentloaded", timeout=18000)
+                        page.wait_for_timeout(1800)
+                        if _tim_link_trong_cmt(_lay_url_binh_luan_da_hien(page), expected):
+                            return "da_co_link"
+                    # FB có thể hiện số cmt nhưng không trả nội dung cho trình duyệt khách.
+                    # Phân biệt trường hợp này với 'đã đọc cmt nhưng chưa thấy link'.
+                    visible = page.evaluate("""() => ({
+                        guest: !![...document.querySelectorAll('a,button')].find(el =>
+                            /^(log in|đăng nhập)$/i.test((el.innerText || '').trim())),
+                        comments: [...document.querySelectorAll('[aria-label],[data-testid]')].filter(el => {
+                            const label = (el.getAttribute('aria-label') || '').toLowerCase();
+                            const testid = (el.getAttribute('data-testid') || '').toLowerCase();
+                            return /^comment by\\s/.test(label) || /^bình luận của\\s/.test(label)
+                                || testid === 'ufi2comment/body';
+                        }).length
+                    })""")
+                    if visible.get("guest") and not visible.get("comments"):
+                        return "bi_an_voi_khach"
+                finally:
+                    cao_fb.don_dep_trang(page, ctx)
+            finally:
+                browser.close()
+    except Exception as e:
+        cap_nhat_trang_thai(log_moi=f"⚠️ Xác minh cmt không đọc được bài {post_url}: {type(e).__name__}")
+    return "chua_xac_minh"
+
+
+def _ket_thuc_xac_minh_bai(post_url: str, expected: str, result: str):
+    """Cập nhật đúng bài lịch sử, không đánh dấu OK nếu chưa nhìn thấy link thật."""
+    if result not in ("da_co_link", "bi_an_voi_khach"):
+        return
+    with KHOA:
+        ls = doc_lich_su()
+        matches = [it for it in ls.get("danh_sach", []) if it.get("link_fb") == post_url
+                   and not it.get("da_gan_cmt") and it.get("xac_minh_cmt") != "thu_cong"]
+        if not matches or doc_cau_hinh().get("link_xac_minh_cmt", "").strip() != expected:
+            return
+        keys = set(ls.get("da_danh_dau_ok", []))
+        for item in matches:
+            if result == "da_co_link":
+                item["da_gan_cmt"] = True
+                item["xac_minh_cmt"] = "da_co_link"
+                item["link_cmt_xac_minh"] = expected
+                item["trang_thai_link"] = "CO_LINK_DA_XAC_MINH"
+                keys.update(item.get("fingerprints") or [])
+                for k in (item.get("post_id"), item.get("link_fb")):
+                    if k:
+                        keys.add(str(k))
+            else:
+                item["xac_minh_cmt"] = "bi_an_voi_khach"
+        if result == "da_co_link":
+            ls["da_danh_dau_ok"] = sorted(keys)
+        with open(FILE_LICH_SU, "w", encoding="utf-8") as f:
+            json.dump(ls, f, ensure_ascii=False, indent=2)
+    if result == "da_co_link":
+        cap_nhat_trang_thai(log_moi=f"✅ Đã thấy link đúng tên miền trong bình luận: {post_url}; tự động đánh dấu OK.")
+    else:
+        cap_nhat_trang_thai(log_moi=f"🔒 {post_url}: Facebook hiển thị số cmt nhưng không hiển thị nội dung cho phiên khách; chưa xác minh, không tự đánh dấu OK.")
+
+
+def _chon_bai_can_xac_minh(items: list[dict], urls_moi: list[str], cursor: int = 0, limit: int = 10):
+    """Ưu tiên bài mới, rồi xoay vòng các bài cũ chưa OK để không bỏ sót bài ở cuối lịch sử."""
+    eligible = list(dict.fromkeys(it.get("link_fb") for it in items
+                    if it.get("link_fb") and not it.get("da_gan_cmt")
+                    and int(it.get("comments") or 0) > 0 and it.get("xac_minh_cmt") != "thu_cong"))
+    if not eligible:
+        return [], 0
+    picked = list(dict.fromkeys(url for url in urls_moi if url in eligible))[:limit]
+    old = [url for url in eligible if url not in picked]
+    if old and len(picked) < limit:
+        start = cursor % len(old)
+        count = min(limit - len(picked), len(old))
+        picked.extend((old + old)[start:start + count])
+        cursor = (start + count) % len(old)
+    return picked, cursor
+
+
+def bat_dau_xac_minh_sau_quet(urls_moi: list[str]):
+    """Một worker nền; mỗi vòng kiểm tra lại bài cũ chưa OK, tối đa 10 bài."""
+    global XAC_MINH_THREAD, VI_TRI_XAC_MINH_CU
+    with KHOA_XAC_MINH:
+        if XAC_MINH_THREAD and XAC_MINH_THREAD.is_alive():
+            cap_nhat_trang_thai(log_moi="ℹ️ Lượt xác minh cmt trước vẫn đang chạy; không mở thêm luồng trùng.")
+            return
+        expected = (doc_cau_hinh().get("link_xac_minh_cmt") or "").strip()
+        if not _ten_mien_link(expected) or STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set():
+            return
+        items = doc_lich_su().get("danh_sach", [])
+        urls, VI_TRI_XAC_MINH_CU = _chon_bai_can_xac_minh(items, urls_moi, VI_TRI_XAC_MINH_CU)
+        profiles = {it.get("link_fb"): it.get("link_profile") or "" for it in items if it.get("link_fb")}
+        if not urls:
+            return
+
+        def run():
+            cap_nhat_trang_thai(log_moi=f"🔎 Quét báo nổ đã xong; kiểm tra cmt nền cho {len(urls)} bài chưa OK (gồm bài cũ; tối đa 10 bài/vòng).")
+            for url in urls:
+                if STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set():
+                    break
+                # Một bài lỗi không được dừng cả hàng đợi bài cũ.
+                try:
+                    result = _xac_minh_mot_bai(url, expected, page_url=profiles.get(url, ""))
+                    _ket_thuc_xac_minh_bai(url, expected, result)
+                except Exception as e_verify:
+                    cap_nhat_trang_thai(log_moi=f"⚠️ Không xác minh được cmt {url}: {type(e_verify).__name__}")
+            cap_nhat_trang_thai(log_moi="🏁 Hoàn tất lượt xác minh cmt nền; bài không thấy link vẫn chưa xác minh, vòng sau sẽ kiểm tra lại.")
+        XAC_MINH_THREAD = threading.Thread(target=run, daemon=True, name="XacMinhCmtNen")
+        XAC_MINH_THREAD.start()
 
 
 # ==========================================
@@ -890,14 +1144,14 @@ def quet_profile_lay_bai(page_url: str, so_bai_quet: int = 6, proxy: str = None,
     Hỗ trợ nhận `browser` dùng chung từ worker để tái sử dụng, tránh mở/đóng tiến trình trình duyệt liên tục."""
     ket_qua = []
 
-    def _quet_tren_browser(b):
+    def _quet_tren_browser(b, chan_anh=True):
         ctx = b.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=cao_fb.DEFAULT_UA,
             locale="en-US"
         )
         # Quét giám sát chỉ cần text + số liệu -> chặn cả ảnh/video/font, tiết kiệm RAM
-        cao_fb.chan_tai_nguyen_nang(ctx, chan_anh=True)
+        cao_fb.chan_tai_nguyen_nang(ctx, chan_anh=chan_anh)
         page = ctx.new_page()
         try:
             cao_fb.cai_dat_bypass_popup(page, ctx)
@@ -930,6 +1184,7 @@ def quet_profile_lay_bai(page_url: str, so_bai_quet: int = 6, proxy: str = None,
                 pass
 
             arts = cao_fb.lay_du_lieu_dom(page, so_bai_quet)
+            cap_nhat_trang_thai(log_moi=f"🔎 {page_url}: timeline đọc {len(arts)} bài (trang trả về: {page.url})")
 
             # KIỂM TRA BỔ SUNG TAB REELS:
             # Đối với Fanpage / Profile dạng New Pages Experience chuyên đi Reels,
@@ -961,6 +1216,7 @@ def quet_profile_lay_bai(page_url: str, so_bai_quet: int = 6, proxy: str = None,
                         page.mouse.wheel(0, 1200)
                         page.wait_for_timeout(800)
                     arts_reels = cao_fb.lay_du_lieu_dom(page, so_bai_quet + 4)
+                    cap_nhat_trang_thai(log_moi=f"🎞️ {page_url}: tab Reels đọc {len(arts_reels)} bài (trang trả về: {page.url})")
 
                     # 1. Trích xuất bản đồ views từ tab Reels theo reel ID
                     reels_views_map = {}
@@ -984,8 +1240,8 @@ def quet_profile_lay_bai(page_url: str, so_bai_quet: int = 6, proxy: str = None,
                         if rid not in seen_reel_ids:
                             arts.append(ar)
                             seen_reel_ids.add(rid)
-                except Exception:
-                    pass
+                except Exception as e_reels:
+                    cap_nhat_trang_thai(log_moi=f"⚠️ {page_url}: không mở được tab Reels: {e_reels}")
 
             # Kiểm tra bóc tách chi tiết cho các bài Reel nổ mà thiếu caption hoặc chưa có comment
             for a in arts:
@@ -1022,13 +1278,21 @@ def quet_profile_lay_bai(page_url: str, so_bai_quet: int = 6, proxy: str = None,
         finally:
             cao_fb.don_dep_trang(page, ctx)
 
+    def _quet_voi_fallback(b):
+        _quet_tren_browser(b)
+        if not ket_qua and not (STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set()):
+            # Trang trả về 0 bài với context chặn ảnh: thử lại đầy đủ tài nguyên.
+            # Một số Page công khai chỉ render post khi ảnh / script lazy-load hoàn tất.
+            cap_nhat_trang_thai(log_moi=f"🔄 {page_url}: chặn ảnh đọc 0 bài, thử lại một lần không chặn ảnh")
+            _quet_tren_browser(b, chan_anh=False)
+
     if browser is not None:
-        _quet_tren_browser(browser)
+        _quet_voi_fallback(browser)
     else:
         with sync_playwright() as p:
             b_local = cao_fb.mo_trinh_duyet(p, cookies=None, proxy=proxy)
             try:
-                _quet_tren_browser(b_local)
+                _quet_voi_fallback(b_local)
             finally:
                 try:
                     b_local.close()
@@ -1044,10 +1308,8 @@ def xu_ly_mot_vong_quet() -> dict:
     masters_kich_hoat = cfg.get("masters_kich_hoat", {"us": True, "us2": True, "global": True})
     ds_profile_all = cfg.get("danh_sach_profile", [])
     if not ds_profile_all:
-        kq_3m = nap_danh_sach_profile_tu_3_master(masters_kich_hoat)
-        ds_profile_all = kq_3m.get("danh_sach_kich_hoat", [])
-        cfg["danh_sach_profile"] = ds_profile_all
-        luu_cau_hinh(cfg)
+        cap_nhat_trang_thai(so_profile=0, tien_do="Chưa có link Facebook để quét", log_moi="⚠️ Danh sách link đang trống: dán link Page/Profile rồi Lưu trước khi quét.")
+        return {"so_profile": 0, "so_bai_no": 0, "so_bai_no_co_link": 0, "so_bai_no_chua_link": 0}
 
     # Lọc danh sách profile theo các Master đang được BẬT hoặc profile do người dùng tự nhập
     ds_profile = []
@@ -1083,19 +1345,28 @@ def xu_ly_mot_vong_quet() -> dict:
                 seen.add(u_norm)
                 ds_profile.append(p)
 
+    if not ds_profile:
+        cap_nhat_trang_thai(so_profile=0, tien_do="Không có link hợp lệ để quét", log_moi="⚠️ Danh sách link không có trang nào đủ điều kiện quét.")
+        return {"so_profile": 0, "so_bai_no": 0, "so_bai_no_co_link": 0, "so_bai_no_chua_link": 0}
+
     nguong_view = int(cfg.get("nguong_view") or 1000)
     nguong_like = int(cfg.get("nguong_like") or 10)
     so_bai_quet = int(cfg.get("so_bai_quet") or 6)
     target_tele = cfg.get("telegram_target", "").strip()
 
-    # Nạp danh sách proxy từ proxies.txt
+    # Nạp đúng file proxy của bản độc lập, không phụ thuộc working directory.
     proxies = []
-    if os.path.exists("proxies.txt"):
+    proxy_file = os.path.join(THU_MUC_HIENTAI, "proxies.txt")
+    if os.path.exists(proxy_file):
         try:
-            proxies_raw = cao_fb.doc_proxies("proxies.txt")
-            from scraper import loc_proxy_song
-            proxies = loc_proxy_song(proxies_raw, max_timeout=3.5)
-        except Exception:
+            proxies_raw = cao_fb.doc_proxies(proxy_file)
+            if proxies_raw:
+                from scraper import loc_proxy_song
+                proxies = loc_proxy_song(proxies_raw, max_timeout=3.5)
+                cap_nhat_trang_thai(log_moi=f"🌐 Proxy: {len(proxies)}/{len(proxies_raw)} kết nối được ở lần thử nhanh; "
+                                           + ("dùng proxy cho vòng này." if proxies else "dùng IP máy cho vòng này."))
+        except Exception as e_proxy:
+            cap_nhat_trang_thai(log_moi=f"⚠️ Không đọc/kiểm tra được file proxy ({type(e_proxy).__name__}); dùng IP máy.")
             proxies = []
 
     # GIỚI HẠN SỐ TRÌNH DUYỆT SONG SONG: mỗi worker mở 1 trình duyệt thật
@@ -1104,13 +1375,15 @@ def xu_ly_mot_vong_quet() -> dict:
     tran_theo_ram = cao_fb.gioi_han_trinh_duyet_theo_ram()
     so_worker = min(max(len(proxies), 1),
                     max(1, int(cfg.get("song_song") or 3)),
-                    tran_theo_ram)
+                    tran_theo_ram,
+                    len(ds_profile))
 
     ls = doc_lich_su()
     da_bao_views = ls.get("da_bao_no_views", {})
     da_bao_likes = ls.get("da_bao_no_likes", {})
 
     so_bai_no_vong_nay = 0
+    urls_can_xac_minh = []
     so_bai_no_co_link_vong_nay = 0
     so_bai_no_chua_link_vong_nay = 0
 
@@ -1121,13 +1394,10 @@ def xu_ly_mot_vong_quet() -> dict:
     lock_state = threading.Lock()
     so_da_quet = 0
 
-    masters_bat = [k.upper() for k, v in masters_kich_hoat.items() if v]
-    masters_str = ", ".join(masters_bat) if masters_bat else "Không chọn Master nào"
-
     cap_nhat_trang_thai(
         so_profile=len(ds_profile),
-        tien_do=f"Bắt đầu quét {len(ds_profile)} profile [{masters_str}] ({so_worker} luồng song song)...",
-        log_moi=f"🚀 Bắt đầu quét {len(ds_profile)} profile [{masters_str}] ({so_worker} luồng, ngưỡng view={nguong_view:,}, bài/profile={so_bai_quet})"
+        tien_do=f"Bắt đầu quét {len(ds_profile)} link đã lưu ({so_worker} luồng)...",
+        log_moi=f"🚀 Bắt đầu quét {len(ds_profile)} link đã lưu ({so_worker} luồng, ngưỡng view={nguong_view:,}, bài/trang={so_bai_quet})"
     )
 
     def worker_loop(w_idx):
@@ -1148,7 +1418,7 @@ def xu_ly_mot_vong_quet() -> dict:
             so_quet_worker = 0
             try:
                 while not hang_doi.empty():
-                    if STOP_EVENT.is_set():
+                    if STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set():
                         break
                     try:
                         i, item = hang_doi.get_nowait()
@@ -1170,15 +1440,23 @@ def xu_ly_mot_vong_quet() -> dict:
                     try:
                         posts = quet_profile_lay_bai(url, so_bai_quet=so_bai_quet, proxy=px, timeout=35, browser=browser, nguong_view=nguong_view)
                     except Exception as e_prof:
-                        # Tự động thử lại 1 lần trực tiếp nếu proxy bị lỗi kết nối
-                        try:
-                            time.sleep(1.5)
-                            posts = quet_profile_lay_bai(url, so_bai_quet=so_bai_quet, proxy=None, timeout=30, nguong_view=nguong_view)
-                        except Exception:
-                            with lock_state:
-                                cap_nhat_trang_thai(log_moi=f"⚠️ [W{w_idx+1}] {ten_prof}: lỗi ({e_prof}) -> bỏ qua")
+                        # Chỉ thử lại qua IP thật khi vòng hiện tại dùng proxy.
+                        if px and not (STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set()):
+                            try:
+                                posts = quet_profile_lay_bai(url, so_bai_quet=so_bai_quet, proxy=None, timeout=30, nguong_view=nguong_view)
+                            except Exception as e_direct:
+                                cap_nhat_trang_thai(log_moi=f"⚠️ [W{w_idx+1}] {url}: proxy lỗi ({e_prof}); IP thật lỗi ({e_direct})")
+                                hang_doi.task_done()
+                                continue
+                        else:
+                            cap_nhat_trang_thai(log_moi=f"⚠️ [W{w_idx+1}] {url}: quét lỗi ({e_prof})")
                             hang_doi.task_done()
                             continue
+
+                    if STOP_EVENT.is_set() or DOI_DANH_SACH_EVENT.is_set():
+                        hang_doi.task_done()
+                        break
+                    cap_nhat_trang_thai(log_moi=f"📄 [W{w_idx+1}] {url}: đọc được {len(posts)} bài; đang kiểm tra ngưỡng {nguong_view:,} view")
 
                     co_bai_no_prof = False
 
@@ -1192,6 +1470,8 @@ def xu_ly_mot_vong_quet() -> dict:
                         post_url = p.get("post_url") or url
                         muoi_tu = lay_10_tu_dau(caption)
                         fps = _tao_fingerprints_bai(ten_prof, pid, post_url, caption)
+                        if views < nguong_view:
+                            cap_nhat_trang_thai(log_moi=f"↳ {post_url}: {views:,} view (chưa đạt ngưỡng {nguong_view:,}), {likes} like, {cmts} cmt")
 
                         # KIỂM TRA BÀI NỔ (views >= nguong_view) — CẢNH BÁO KHI VƯỢT 1000 VIEW
                         if views >= nguong_view:
@@ -1215,7 +1495,7 @@ def xu_ly_mot_vong_quet() -> dict:
 
                                 # Tra cứu link báo tương ứng trong Master / Pool
                                 link_bao, _ = tim_link_bao_tuong_ung(ten_prof, caption)
-                                co_link_cmt = (cmts > 0)
+                                co_link_cmt = (cmts > 0)  # Chỉ là có bình luận; link bài báo CHƯA xác minh.
 
                                 if co_link_cmt:
                                     with lock_state:
@@ -1228,7 +1508,7 @@ def xu_ly_mot_vong_quet() -> dict:
                                         dong_view = f"📈 Views: {views:,} (Tăng +{view_tang:,} từ {view_cu:,} view cũ | Ngưỡng: {nguong_view:,})"
                                         log_str = f"🚀 [BÀI NỔ CÓ CMT (+{view_tang:,} VIEW)] {ten_prof} ({ten_page}): {views:,} view, {likes} like, {cmts} cmt"
                                     else:
-                                        tieu_de_tele = f"🔥 [BÀI NỔ ĐẠT {views:,} VIEW - ĐÃ CÓ LINK CMT]"
+                                        tieu_de_tele = f"🔥 [BÀI NỔ ĐẠT {views:,} VIEW - CÓ BÌNH LUẬN, CHƯA XÁC MINH LINK]"
                                         dong_view = f"👁️ Views: {views:,} (Ngưỡng cảnh báo: {nguong_view:,})"
                                         log_str = f"🔥 [BÀI NỔ CÓ CMT] {ten_prof} ({ten_page}): {views:,} view, {likes} like, {cmts} cmt"
 
@@ -1239,12 +1519,12 @@ def xu_ly_mot_vong_quet() -> dict:
                                         f"📄 Tên Page: {ten_page}\n"
                                         f"{dong_view}\n"
                                         f"👍 Likes: {likes} | 💬 Comments: {cmts} | 🔄 Shares: {shares}\n"
-                                        f"🔗 Trạng thái cmt: ✅ CÓ LINK CMT ({cmts} bình luận)\n"
+                                        f"🔗 Trạng thái cmt: {cmts} bình luận; chưa xác minh link bài báo\n"
                                         f"🔗 Link bài viết: {post_url}\n"
                                         f"📝 Caption: {muoi_tu}"
                                         f"{link_bao_str}"
                                     )
-                                    loai_record = "BAI_NO_CO_LINK"
+                                    loai_record = "BAI_NO_CO_CMT_CHUA_XAC_MINH"
                                 else:
                                     with lock_state:
                                         so_bai_no_vong_nay += 1
@@ -1298,18 +1578,22 @@ def xu_ly_mot_vong_quet() -> dict:
                                     "gui_tele": ok,
                                     "tele_msg": err,
                                     "fingerprints": fps,
-                                    "trang_thai_link": "CO_LINK" if co_link_cmt else "CHUA_LINK",
+                                    "trang_thai_link": "CHUA_XAC_MINH" if co_link_cmt else "CHUA_LINK",
+                                    "xac_minh_cmt": "chua_xac_minh",
                                 }
                                 ghi_lich_su_canh_bao(record)
+                                if cmts > 0 and post_url:
+                                    with lock_state:
+                                        urls_can_xac_minh.append(post_url)
                                 with lock_state:
                                     cap_nhat_trang_thai(log_moi=f"{log_str} | Tele: {'✅' if ok else '❌ ' + err}")
 
                     if not co_bai_no_prof:
                         with lock_state:
                             if posts:
-                                cap_nhat_trang_thai(log_moi=f"✅ [W{w_idx+1}] {ten_prof} ({ten_page}): {len(posts)} bài bình thường (không có bài nổ)")
+                                cap_nhat_trang_thai(log_moi=f"ℹ️ [W{w_idx+1}] {url}: đã đọc {len(posts)} bài, chưa ghi nhận bài mới vượt {nguong_view:,} view (xem chi tiết từng bài phía trên)")
                             else:
-                                cap_nhat_trang_thai(log_moi=f"ℹ️ [W{w_idx+1}] {ten_prof} ({ten_page}): Không tìm thấy bài viết mới trên trang")
+                                cap_nhat_trang_thai(log_moi=f"⚠️ [W{w_idx+1}] {url}: không lấy được bài từ trang; không thể kết luận không có bài nổ")
 
                     hang_doi.task_done()
                 so_quet_worker += 1
@@ -1343,8 +1627,8 @@ def xu_ly_mot_vong_quet() -> dict:
     st_now = doc_trang_thai()
     chu_ky_nghi = int(cfg.get("chu_ky_phut") or 5)
     if so_bai_no_vong_nay == 0:
-        log_ket_thuc = f"✨ [HOÀN THÀNH VÒNG QUÉT] Quét xong {len(ds_profile)} profile ({so_worker} luồng): Tất cả bình thường, KHÔNG phát hiện bài nổ mới."
-        tien_do_str = f"Tất cả {len(ds_profile)} profile bình thường (0 bài nổ). Chờ chu kỳ tiếp theo ({chu_ky_nghi} phút)..."
+        log_ket_thuc = f"ℹ️ [HOÀN THÀNH VÒNG QUÉT] Đã thử {len(ds_profile)} link ({so_worker} luồng), chưa ghi nhận bài mới đạt ngưỡng; xem cảnh báo của từng trang."
+        tien_do_str = f"Đã thử {len(ds_profile)} link; chưa ghi nhận bài đạt ngưỡng. Chờ {chu_ky_nghi} phút..."
     else:
         log_ket_thuc = f"🏁 Đã quét xong {len(ds_profile)} profile ({so_worker} luồng). Vòng này: +{so_bai_no_vong_nay} bài nổ (+{so_bai_no_co_link_vong_nay} có link cmt, +{so_bai_no_chua_link_vong_nay} chưa gắn link)."
         tien_do_str = f"Hoàn thành 1 vòng (+{so_bai_no_vong_nay} bài nổ: {so_bai_no_co_link_vong_nay} có link, {so_bai_no_chua_link_vong_nay} chưa link). Chờ chu kỳ tiếp theo ({chu_ky_nghi} phút)..."
@@ -1358,6 +1642,10 @@ def xu_ly_mot_vong_quet() -> dict:
         so_bai_chua_cmt=st_now.get("so_bai_no_chua_link", 0) + so_bai_no_chua_link_vong_nay,
         log_moi=log_ket_thuc
     )
+
+    # Đưa bài nổ lên bảng/gửi cảnh báo trước; xác minh bình luận chạy nền sau vòng quét.
+    if not STOP_EVENT.is_set() and not DOI_DANH_SACH_EVENT.is_set():
+        bat_dau_xac_minh_sau_quet(urls_can_xac_minh)
 
     return {
         "so_profile": len(ds_profile),
@@ -1373,11 +1661,18 @@ def xu_ly_mot_vong_quet() -> dict:
 
 def _vong_lap_daemon():
     while not STOP_EVENT.is_set():
+        DOI_DANH_SACH_EVENT.clear()
         cap_nhat_trang_thai(dang_chay=True)
         try:
-            xu_ly_mot_vong_quet()
+            with KHOA_VONG_QUET:
+                xu_ly_mot_vong_quet()
         except Exception as e:
             cap_nhat_trang_thai(log_moi=f"❌ Lỗi vòng quét: {e}")
+        if STOP_EVENT.is_set():
+            break
+        if DOI_DANH_SACH_EVENT.is_set():
+            cap_nhat_trang_thai(log_moi="🔄 Danh sách đã thay đổi, đang quét lại link mới...")
+            continue
 
         cfg = doc_cau_hinh()
         chu_ky_phut = max(1, int(cfg.get("chu_ky_phut") or 5))
@@ -1385,40 +1680,61 @@ def _vong_lap_daemon():
             tien_do=f"Chờ chu kỳ tiếp theo ({chu_ky_phut} phút)...",
             log_moi=f"⏳ Nghỉ {chu_ky_phut} phút trước vòng quét tiếp theo..."
         )
-        if STOP_EVENT.wait(timeout=chu_ky_phut * 60):
-            break
+        # Lưu cấu hình / Quét ngay đánh thức vòng lặp, không tạo thêm worker song song.
+        DOI_DANH_SACH_EVENT.wait(timeout=chu_ky_phut * 60)
 
     cap_nhat_trang_thai(dang_chay=False, tien_do="Đã dừng theo yêu cầu", log_moi="⏹️ Đã dừng giám sát 24/24")
 
 
 def bat_dau_giam_sat() -> tuple[bool, str]:
     global GIAM_SAT_THREAD
-    if GIAM_SAT_THREAD and GIAM_SAT_THREAD.is_alive():
-        return False, "Hệ thống giám sát bài nổ 24/24 đang chạy rồi!"
-
-    STOP_EVENT.clear()
-    GIAM_SAT_THREAD = threading.Thread(target=_vong_lap_daemon, daemon=True, name="LuongGiamSatBaiNo247")
-    GIAM_SAT_THREAD.start()
-    cap_nhat_trang_thai(dang_chay=True, tien_do="Đang khởi động vòng quét...", log_moi="▶️ Đã kích hoạt giám sát bài nổ 24/24")
-    return True, "Đã khởi động thành công hệ thống giám sát bài nổ 24/24!"
+    with KHOA:
+        if QUET_THU_CONG_THREAD and QUET_THU_CONG_THREAD.is_alive():
+            return False, "Đang quét thủ công; chờ hoàn tất rồi bật giám sát 24/24."
+        if GIAM_SAT_THREAD and GIAM_SAT_THREAD.is_alive():
+            if STOP_EVENT.is_set():
+                return False, "Luồng cũ đang dừng; đợi kết thúc rồi bấm Bật lại."
+            DOI_DANH_SACH_EVENT.set()
+            return True, "Đã yêu cầu vòng quét đang chạy nạp lại danh sách mới; không chạy trùng luồng."
+        STOP_EVENT.clear()
+        DOI_DANH_SACH_EVENT.clear()
+        GIAM_SAT_THREAD = threading.Thread(target=_vong_lap_daemon, daemon=True, name="LuongGiamSatBaiNo247")
+        GIAM_SAT_THREAD.start()
+    cap_nhat_trang_thai(dang_chay=True, tien_do="Đang khởi động vòng quét...", log_moi="▶️ Đã kích hoạt giám sát 24/24")
+    return True, "Đã khởi động giám sát 24/24."
 
 
 def dung_giam_sat() -> tuple[bool, str]:
-    global GIAM_SAT_THREAD
     STOP_EVENT.set()
-    cap_nhat_trang_thai(dang_chay=False, tien_do="Đã gửi lệnh dừng...", log_moi="⏹️ Đang dừng tiến trình giám sát...")
-    return True, "Đã gửi lệnh dừng giám sát thành công!"
+    DOI_DANH_SACH_EVENT.set()
+    cap_nhat_trang_thai(tien_do="Đang dừng vòng quét...", log_moi="⏹️ Đã yêu cầu dừng, chờ trang đang mở kết thúc...")
+    return True, "Đã gửi yêu cầu dừng; chờ trang đang mở kết thúc."
 
 
 def quet_thu_cong_ngay() -> tuple[bool, str]:
-    """Kích hoạt quét thủ công ngay 1 vòng không cần chờ chu kỳ."""
+    """Quét lại ngay với danh sách đã lưu, không tạo worker trùng lặp."""
+    global QUET_THU_CONG_THREAD
+    if GIAM_SAT_THREAD and GIAM_SAT_THREAD.is_alive() and not STOP_EVENT.is_set():
+        DOI_DANH_SACH_EVENT.set()
+        cap_nhat_trang_thai(log_moi="🔄 Quét ngay: bỏ phần còn lại của danh sách cũ và nạp link mới...")
+        return True, "Đã yêu cầu quét danh sách mới ngay sau khi trang đang mở kết thúc."
+    if STOP_EVENT.is_set() and GIAM_SAT_THREAD and GIAM_SAT_THREAD.is_alive():
+        return False, "Đang dừng vòng cũ; vui lòng chờ kết thúc rồi quét lại."
+    if not KHOA_VONG_QUET.acquire(blocking=False):
+        return False, "Một vòng quét đang chạy, vui lòng chờ kết thúc."
+    STOP_EVENT.clear()
+    DOI_DANH_SACH_EVENT.clear()
+
     def _chay():
         try:
-            cap_nhat_trang_thai(tien_do="Đang quét thủ công 1 vòng...", log_moi="⚡ Bắt đầu quét thủ công ngay 1 vòng...")
+            cap_nhat_trang_thai(dang_chay=True, tien_do="Đang quét thủ công...", log_moi="⚡ Quét ngay danh sách link đã lưu...")
             xu_ly_mot_vong_quet()
+            cap_nhat_trang_thai(dang_chay=False, log_moi="🏁 Hoàn tất quét thủ công 1 vòng.")
         except Exception as e:
-            cap_nhat_trang_thai(log_moi=f"❌ Lỗi quét thủ công: {e}")
+            cap_nhat_trang_thai(dang_chay=False, log_moi=f"❌ Lỗi quét thủ công: {e}")
+        finally:
+            KHOA_VONG_QUET.release()
 
-    t = threading.Thread(target=_chay, daemon=True)
-    t.start()
-    return True, "Đã kích hoạt quét ngay 1 vòng thành công!"
+    QUET_THU_CONG_THREAD = threading.Thread(target=_chay, daemon=True, name="QuetThuCongBaiNo")
+    QUET_THU_CONG_THREAD.start()
+    return True, "Đã kích hoạt quét ngay danh sách link đã lưu."
