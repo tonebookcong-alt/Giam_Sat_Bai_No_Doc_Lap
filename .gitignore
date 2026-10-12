@@ -1,0 +1,28 @@
+﻿# Playwright browser binaries (chrome.dll > 280MB exceeds GitHub 100MB limit)
+ms-playwright/
+
+# Sensitive Facebook credentials & accounts
+cookies.txt
+*via*.xlsx
+*fb_accounts*.xlsx
+*.env
+.env*
+
+# Python cache & build outputs
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Logs
+*.log
+
+# IDE & OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

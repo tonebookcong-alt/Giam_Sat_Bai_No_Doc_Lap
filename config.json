@@ -1,0 +1,52 @@
+{
+  "cookies_file": "cookies.txt",
+  "ai": {
+    "provider": "custom",
+    "api_key": "sk-1601e321ce9a1c7602a5dc9f069780f0fa2894ea635da8bd",
+    "model": "deepseek-v4-flash",
+    "base_url": "https://vyceai.com/v1",
+    "song_song": 1
+  },
+  "sheets": {
+    "credentials_file": "google_sheets_creds.json",
+    "spreadsheet_id": ""
+  },
+  "website": {
+    "us": {
+      "api_url": "https://dailyneweveryday.danhngon.pro/api/posts",
+      "api_token": "rta3tw4ve53ikevn83vdz6h8lc33lm",
+      "mode": "blogbio"
+    },
+    "global": {
+      "api_url": "https://dailyneweveryday.danhngon.pro/api/posts",
+      "api_token": "rta3tw4ve53ikevn83vdz6h8lc33lm",
+      "mode": "blogbio"
+    }
+  },
+  "luong_a": {
+    "so_bai_moi_nguon": 10,
+    "so_lan_cuon": 3,
+    "delay": 3.0
+  },
+  "content_han_ngay": 7,
+  "media": {
+    "logo_path": "logo.png",
+    "logo_position": "bottom_left",
+    "logo_scale": 0.17,
+    "max_size": 1080,
+    "crop_vien": 4,
+    "border_style": "solid",
+    "border_width": 3,
+    "border_color": "#D4AF37",
+    "border_color2": "#D4AF37",
+    "border_color3": "#D4AF37",
+    "enhance_contrast": 1.1,
+    "enhance_brightness": 1.05,
+    "enhance_color": 1.22
+  },
+  "proxy": {
+    "bat": true,
+    "proxies_file": "proxies.txt",
+    "ti_le_phien": 0.5
+  }
+}
